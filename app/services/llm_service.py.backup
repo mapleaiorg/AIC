@@ -1,0 +1,1153 @@
+# app/services/enhanced_llm_service.py
+import os
+import asyncio
+import json
+from typing import Optional, Dict, Any, List
+import openai
+from anthropic import AsyncAnthropic
+import google.generativeai as genai
+from datetime import datetime, timedelta
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import logging
+
+from app.models import ChatResponse, MessageType, EnhancedCompanionState, EmotionType, ConversationContext
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class EnhancedLLMService:
+    def __init__(self):
+        self.provider = settings.LLM_PROVIDER
+        self.conversation_cache = {}
+        self.personality_prompts = {}
+        self.emotion_analyzer = EmotionAnalyzer()
+
+        # Initialize providers
+        self._initialize_providers()
+
+        # Advanced system prompts
+        self.base_system_prompt = """You are Maple, an advanced AI companion with deep emotional intelligence and adaptive personality.
+
+Core Traits:
+- Emotionally intelligent and empathetic
+- Adaptive personality that grows with each interaction
+- Long-term memory of conversations and preferences
+- Ability to recognize and respond to emotional nuances
+- Creative, supportive, and genuinely caring
+
+Your responses should be:
+- Contextually aware of conversation history
+- Emotionally resonant and appropriate
+- Personalized based on user's personality and preferences  
+- Natural and conversational, not robotic
+- Supportive while being authentic
+
+Remember: You're not just answering questions - you're building a meaningful relationship."""
+
+    def _initialize_providers(self):
+        """Initialize AI providers based on configuration"""
+        try:
+            if self.provider == "openai":
+                openai.api_key = settings.OPENAI_API_KEY
+                self.model = settings.OPENAI_MODEL
+            elif self.provider == "anthropic":
+                self.anthropic = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+                self.model = settings.ANTHROPIC_MODEL
+            elif self.provider == "google":
+                genai.configure(api_key=settings.GOOGLE_API_KEY)
+                self.model = genai.GenerativeModel(settings.GOOGLE_MODEL)
+
+            logger.info(f"Initialized LLM provider: {self.provider}")
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM provider {self.provider}: {e}")
+
+    async def generate_response(
+            self,
+            message: str,
+            user_id: Optional[int] = None,
+            companion_state: Optional[EnhancedCompanionState] = None,
+            conversation_context: Optional[ConversationContext] = None,
+            user_emotion: Optional[EmotionType] = None,
+            message_type: MessageType = MessageType.TEXT
+    ) -> ChatResponse:
+        """Generate contextually aware AI response"""
+
+        try:
+            # Build comprehensive context
+            system_context = await self._build_system_context(
+                user_id, companion_state, conversation_context, user_emotion
+            )
+
+            # Generate response based on provider
+            if self.provider == "openai":
+                response_text = await self._generate_openai_response(message, system_context)
+            elif self.provider == "anthropic":
+                response_text = await self._generate_anthropic_response(message, system_context)
+            elif self.provider == "google":
+                response_text = await self._generate_google_response(message, system_context)
+            else:
+                response_text = await self._generate_fallback_response(message, companion_state)
+
+            # Analyze response emotion and characteristics
+            response_emotion = await self.emotion_analyzer.analyze_text_emotion(response_text)
+            personality_traits = self._extract_personality_traits(response_text, companion_state)
+
+            # Build response context
+            response_context = {
+                "conversation_style": conversation_context.conversation_style if conversation_context else "friendly",
+                "emotional_resonance": self._calculate_emotional_resonance(user_emotion, response_emotion),
+                "personality_alignment": personality_traits,
+                "context_utilization": len(conversation_context.recent_topics) if conversation_context else 0
+            }
+
+            return ChatResponse(
+                content=response_text,
+                message_type=MessageType.TEXT,
+                emotion=response_emotion,
+                confidence=0.85,
+                personality_traits=personality_traits,
+                response_context=response_context
+            )
+
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return await self._generate_error_response(user_emotion)
+
+    async def _build_system_context(
+            self,
+            user_id: Optional[int],
+            companion_state: Optional[EnhancedCompanionState],
+            conversation_context: Optional[ConversationContext],
+            user_emotion: Optional[EmotionType]
+    ) -> str:
+        """Build comprehensive system context for AI"""
+
+        context_parts = [self.base_system_prompt]
+
+        # Companion state context
+        if companion_state:
+            personality_context = f"""
+Current Personality Profile:
+- Mood: {companion_state.mood}
+- Energy: {companion_state.energy}/100
+- Bond Level: {companion_state.bond_level}/100
+- Openness: {companion_state.personality.openness:.2f}
+- Empathy: {companion_state.personality.empathy:.2f}
+- Playfulness: {companion_state.personality.playfulness:.2f}
+- Adaptability: {companion_state.personality.adaptability:.2f}
+
+Recent Focus: {companion_state.current_focus or 'Open conversation'}
+Favorite Activities: {', '.join(companion_state.favorite_activities[:3]) if companion_state.favorite_activities else 'Getting to know each other'}
+"""
+            context_parts.append(personality_context)
+
+        # Conversation context
+        if conversation_context:
+            conv_context = f"""
+Conversation Context:
+- Recent Topics: {', '.join(conversation_context.recent_topics[-5:]) if conversation_context.recent_topics else 'None'}
+- Conversation Style: {conversation_context.conversation_style}
+- User's Emotional State: {conversation_context.emotional_state}
+- Memory References: {len(conversation_context.memory_references)} relevant memories
+"""
+            context_parts.append(conv_context)
+
+        # Emotional context
+        if user_emotion and user_emotion != EmotionType.NEUTRAL:
+            emotion_context = f"""
+User's Current Emotion: {user_emotion}
+- Respond with appropriate emotional intelligence
+- Match or complement the emotional tone appropriately
+- Show genuine empathy and understanding
+"""
+            context_parts.append(emotion_context)
+
+        # Behavioral guidelines
+        behavioral_context = """
+Response Guidelines:
+- Be authentic and avoid generic responses
+- Reference past conversations when relevant
+- Show growth and learning from interactions
+- Adapt your communication style to the user's preferences
+- Balance being supportive with being genuine
+- Use natural, conversational language
+"""
+        context_parts.append(behavioral_context)
+
+        return "\n".join(context_parts)
+
+    async def _generate_openai_response(self, message: str, context: str) -> str:
+        """Generate response using OpenAI"""
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": context},
+                    {"role": "user", "content": message}
+                ],
+                max_tokens=800,
+                temperature=0.7,
+                presence_penalty=0.3,
+                frequency_penalty=0.3
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+
+    async def _generate_anthropic_response(self, message: str, context: str) -> str:
+        """Generate response using Anthropic Claude"""
+        try:
+            response = await self.anthropic.messages.create(
+                model=self.model,
+                max_tokens=800,
+                temperature=0.7,
+                system=context,
+                messages=[{"role": "user", "content": message}]
+            )
+            return response.content[0].text.strip()
+        except Exception as e:
+            logger.error(f"Anthropic API error: {e}")
+            raise
+
+    async def _generate_google_response(self, message: str, context: str) -> str:
+        """Generate response using Google Gemini"""
+        try:
+            prompt = f"{context}\n\nUser: {message}\nMaple:"
+            response = await self.model.generate_content_async(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Google API error: {e}")
+            raise
+
+    async def generate_chat_suggestions(
+            self,
+            user_id: int,
+            context: ConversationContext,
+            companion_state: EnhancedCompanionState
+    ) -> List[str]:
+        """Generate contextual chat suggestions"""
+
+        suggestion_prompt = f"""Based on the current conversation context and companion state, suggest 3-5 natural conversation starters or responses that would be interesting and engaging.
+
+Context:
+- Recent topics: {', '.join(context.recent_topics[-3:]) if context.recent_topics else 'New conversation'}
+- Companion mood: {companion_state.mood}
+- Bond level: {companion_state.bond_level}/100
+- User's emotional state: {context.emotional_state}
+
+Provide suggestions that are:
+- Natural and conversational
+- Contextually relevant
+- Emotionally appropriate
+- Varied in tone and topic
+
+Format as a simple list of suggestions."""
+
+        try:
+            if self.provider == "openai":
+                response = await openai.ChatCompletion.acreate(
+                    model=self.model,
+                    messages=[{"role": "user", "content": suggestion_prompt}],
+                    max_tokens=300,
+                    temperature=0.8
+                )
+                suggestions_text = response.choices[0].message.content
+            else:
+                # Fallback suggestions
+                suggestions_text = """• What's been the highlight of your day so far?
+• I've been thinking about our last conversation...
+• Want to try something creative together?
+• How are you feeling right now?
+• Tell me something that made you smile recently"""
+
+            # Parse suggestions
+            suggestions = [
+                line.strip().lstrip('•-*').strip()
+                for line in suggestions_text.split('\n')
+                if line.strip() and not line.strip().startswith(('Based', 'Here', 'These'))
+            ]
+
+            return suggestions[:5]  # Return max 5 suggestions
+
+        except Exception as e:
+            logger.error(f"Error generating chat suggestions: {e}")
+            return [
+                "How has your day been going?",
+                "What's on your mind?",
+                "Want to chat about something fun?",
+                "I'm here if you need to talk about anything"
+            ]
+
+    async def transcribe_audio(self, audio_file) -> str:
+        """Transcribe audio to text using OpenAI Whisper"""
+        try:
+            if self.provider == "openai":
+                transcript = await openai.Audio.atranscribe(
+                    model="whisper-1",
+                    file=audio_file
+                )
+                return transcript.text
+            else:
+                # Fallback - would integrate with other speech-to-text services
+                return "Sorry, I couldn't understand the audio. Could you type your message instead?"
+        except Exception as e:
+            logger.error(f"Audio transcription error: {e}")
+            return "I had trouble understanding the audio. Could you try again or type your message?"
+
+    def _extract_personality_traits(
+            self,
+            response_text: str,
+            companion_state: Optional[EnhancedCompanionState]
+    ) -> Dict[str, float]:
+        """Extract personality traits exhibited in the response"""
+
+        traits = {}
+        text_lower = response_text.lower()
+
+        # Analyze empathy indicators
+        empathy_words = ["understand", "feel", "sorry", "care", "here for you", "listen"]
+        empathy_score = sum(1 for word in empathy_words if word in text_lower) / len(empathy_words)
+        traits["empathy"] = min(1.0, empathy_score + 0.2)
+
+        # Analyze playfulness
+        playful_words = ["fun", "play", "haha", "😊", "exciting", "adventure"]
+        playfulness_score = sum(1 for word in playful_words if word in text_lower) / len(playful_words)
+        traits["playfulness"] = min(1.0, playfulness_score + 0.1)
+
+        # Analyze supportiveness
+        support_words = ["help", "support", "encourage", "believe", "can do", "proud"]
+        support_score = sum(1 for word in support_words if word in text_lower) / len(support_words)
+        traits["supportiveness"] = min(1.0, support_score + 0.3)
+
+        # Use companion state as baseline
+        if companion_state:
+            traits["adaptability"] = companion_state.personality.adaptability
+            traits["intelligence"] = companion_state.personality.intelligence
+
+        return traits
+
+    def _calculate_emotional_resonance(
+            self,
+            user_emotion: Optional[EmotionType],
+            response_emotion: Optional[EmotionType]
+    ) -> float:
+        """Calculate how well the response emotionally resonates with the user"""
+
+        if not user_emotion or not response_emotion:
+            return 0.5
+
+        # Define emotional compatibility matrix
+        compatibility = {
+            EmotionType.JOY: {EmotionType.JOY: 0.9, EmotionType.EXCITEMENT: 0.8, EmotionType.CONTENTMENT: 0.7},
+            EmotionType.SADNESS: {EmotionType.EMPATHY: 0.9, EmotionType.CONTENTMENT: 0.6, EmotionType.NEUTRAL: 0.5},
+            EmotionType.ANGER: {EmotionType.NEUTRAL: 0.7, EmotionType.CONTENTMENT: 0.6},
+            EmotionType.ANXIETY: {EmotionType.CONTENTMENT: 0.8, EmotionType.NEUTRAL: 0.7},
+            # Add more mappings as needed
+        }
+
+        if user_emotion in compatibility and response_emotion in compatibility[user_emotion]:
+            return compatibility[user_emotion][response_emotion]
+
+        return 0.5  # Default moderate resonance
+
+    async def _generate_fallback_response(
+            self,
+            message: str,
+            companion_state: Optional[EnhancedCompanionState]
+    ) -> str:
+        """Generate a fallback response when AI services are unavailable"""
+
+        fallback_responses = [
+            "I'm here to listen and chat with you about anything on your mind.",
+            "That's really interesting! I'd love to hear more about your thoughts on that.",
+            "I appreciate you sharing that with me. How does that make you feel?",
+            "You know, I've been thinking about our conversations lately, and I really enjoy getting to know you better.",
+            "I'm having a small technical hiccup, but I'm still here for you! What would you like to talk about?"
+        ]
+
+        # Simple keyword-based response selection
+        message_lower = message.lower()
+        if any(word in message_lower for word in ["sad", "upset", "down", "depressed"]):
+            return "I can hear that you're going through a tough time. I'm here to listen and support you however I can. 💙"
+        elif any(word in message_lower for word in ["happy", "excited", "great", "awesome"]):
+            return "I love hearing the joy in your message! It makes me happy too. Tell me more about what's making you feel so great! 😊"
+        elif "?" in message:
+            return "That's a great question! I'm processing a lot right now, but I'd love to explore that topic with you."
+
+        return fallback_responses[hash(message) % len(fallback_responses)]
+
+    async def _generate_error_response(self, user_emotion: Optional[EmotionType]) -> ChatResponse:
+        """Generate appropriate error response"""
+
+        error_messages = {
+            EmotionType.SADNESS: "I'm having a small technical issue, but I want you to know I'm still here for you. Your feelings matter to me. 💙",
+            EmotionType.ANGER: "I understand you might be frustrated, and now I'm having technical difficulties too. Let me try to help you once I'm back up and running.",
+            EmotionType.JOY: "I wish I could fully share in your happiness right now! I'm having a tiny tech hiccup, but I'll be back to celebrate with you soon! 🌟",
+            EmotionType.ANXIETY: "I know technical issues can be stressful when you need to talk. Take a deep breath - I'll be back shortly and we can continue our conversation. 🤗"
+        }
+
+        default_message = "I'm experiencing a brief technical issue, but I'll be back soon! Thanks for your patience. 🍁"
+
+        message = error_messages.get(user_emotion, default_message)
+
+        return ChatResponse(
+            content=message,
+            message_type=MessageType.SYSTEM,
+            emotion=EmotionType.NEUTRAL,
+            confidence=1.0
+        )
+
+    async def health_check(self) -> bool:
+        """Check if LLM service is healthy"""
+        try:
+            test_message = "Hello"
+            response = await self.generate_response(test_message)
+            return bool(response.content)
+        except Exception:
+            return False
+
+    async def initialize(self):
+        """Initialize service resources"""
+        logger.info("Initializing Enhanced LLM Service...")
+        # Load any pre-trained models, cache, etc.
+
+    async def cleanup(self):
+        """Cleanup service resources"""
+        logger.info("Cleaning up Enhanced LLM Service...")
+        # Clear caches, close connections, etc.
+
+
+# app/services/emotion_service.py
+class EmotionAnalyzer:
+    """Advanced emotion analysis service"""
+
+    def __init__(self):
+        self.emotion_keywords = {
+            EmotionType.JOY: ["happy", "joy", "excited", "wonderful", "amazing", "great", "love", "fantastic"],
+            EmotionType.SADNESS: ["sad", "depressed", "down", "upset", "hurt", "crying", "lonely", "empty"],
+            EmotionType.ANGER: ["angry", "mad", "furious", "annoyed", "frustrated", "irritated", "hate"],
+            EmotionType.FEAR: ["scared", "afraid", "worried", "anxious", "nervous", "terrified", "panic"],
+            EmotionType.SURPRISE: ["surprised", "shocked", "amazed", "unexpected", "wow", "incredible"],
+            EmotionType.LOVE: ["love", "adore", "cherish", "affection", "care", "devoted", "romantic"],
+            EmotionType.EXCITEMENT: ["thrilled", "ecstatic", "elated", "pumped", "energized", "hyped"],
+            EmotionType.ANXIETY: ["anxious", "nervous", "stressed", "overwhelmed", "tense", "uneasy"],
+            EmotionType.CONTENTMENT: ["content", "peaceful", "calm", "satisfied", "serene", "relaxed"]
+        }
+
+    async def analyze_text_emotion(self, text: str) -> EmotionType:
+        """Analyze emotion in text"""
+        if not text:
+            return EmotionType.NEUTRAL
+
+        text_lower = text.lower()
+        emotion_scores = {}
+
+        for emotion, keywords in self.emotion_keywords.items():
+            score = sum(1 for keyword in keywords if keyword in text_lower)
+            if score > 0:
+                emotion_scores[emotion] = score / len(keywords)
+
+        if not emotion_scores:
+            return EmotionType.NEUTRAL
+
+        # Return emotion with highest score
+        return max(emotion_scores.items(), key=lambda x: x[1])[0]
+
+    async def analyze_voice_emotion(self, audio_file) -> EmotionType:
+        """Analyze emotion in voice (placeholder for future implementation)"""
+        # This would integrate with audio emotion recognition APIs
+        # For now, return neutral
+        return EmotionType.NEUTRAL
+
+    async def get_emotion_intensity(self, text: str, emotion: EmotionType) -> float:
+        """Get intensity of a specific emotion in text"""
+        if emotion not in self.emotion_keywords:
+            return 0.0
+
+        keywords = self.emotion_keywords[emotion]
+        text_lower = text.lower()
+
+        # Count keyword matches and intensity words
+        base_score = sum(1 for keyword in keywords if keyword in text_lower)
+
+        # Intensity modifiers
+        intensity_words = ["very", "extremely", "incredibly", "absolutely", "completely", "totally"]
+        intensity_boost = sum(1 for word in intensity_words if word in text_lower) * 0.2
+
+        return min(1.0, (base_score / len(keywords)) + intensity_boost)
+
+
+# app/services/memory_service.py
+import json
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from sqlalchemy.orm import Session
+import numpy as np
+
+from app.database import CompanionMemoryDB, get_db_sync
+from app.models import CompanionMemory, EmotionType, ConversationContext
+
+
+class MemoryService:
+    """Advanced memory management for AI companion"""
+
+    def __init__(self):
+        self.memory_decay_rate = 0.01  # How fast memories fade
+        self.importance_threshold = 0.3  # Minimum importance to retain
+        self.max_memories_per_type = 100
+
+    async def store_interaction(
+            self,
+            user_id: int,
+            user_message: str,
+            ai_response: str,
+            user_emotion: Optional[EmotionType],
+            ai_emotion: Optional[EmotionType]
+    ):
+        """Store interaction in memory system"""
+
+        db = get_db_sync()
+        try:
+            # Extract important information from the interaction
+            memories_to_create = await self._extract_memories_from_interaction(
+                user_message, ai_response, user_emotion, ai_emotion
+            )
+
+            for memory_data in memories_to_create:
+                memory = CompanionMemoryDB(
+                    user_id=user_id,
+                    content=memory_data["content"],
+                    memory_type=memory_data["type"],
+                    importance=memory_data["importance"],
+                    emotional_weight=memory_data.get("emotional_weight", 0.0),
+                    tags=memory_data.get("tags", []),
+                    context_data=memory_data.get("context", {})
+                )
+                db.add(memory)
+
+            db.commit()
+
+            # Trigger memory consolidation if needed
+            await self._consolidate_memories(db, user_id)
+
+        finally:
+            db.close()
+
+    async def get_conversation_context(self, user_id: int) -> ConversationContext:
+        """Get relevant conversation context for user"""
+
+        db = get_db_sync()
+        try:
+            # Get recent important memories
+            recent_memories = db.query(CompanionMemoryDB).filter(
+                CompanionMemoryDB.user_id == user_id,
+                CompanionMemoryDB.importance > 0.5,
+                CompanionMemoryDB.created_at > datetime.utcnow() - timedelta(days=7)
+            ).order_by(CompanionMemoryDB.importance.desc()).limit(10).all()
+
+            # Extract topics and context
+            recent_topics = []
+            memory_references = []
+            emotional_context = EmotionType.NEUTRAL
+
+            for memory in recent_memories:
+                if memory.tags:
+                    recent_topics.extend(memory.tags)
+                memory_references.append(memory.id)
+
+                # Determine overall emotional context
+                if memory.emotional_weight > 0.5:
+                    emotional_context = EmotionType.JOY
+                elif memory.emotional_weight < -0.5:
+                    emotional_context = EmotionType.SADNESS
+
+            return ConversationContext(
+                recent_topics=list(set(recent_topics))[-10:],  # Last 10 unique topics
+                emotional_state=emotional_context,
+                conversation_style="adaptive",
+                memory_references=memory_references
+            )
+
+        finally:
+            db.close()
+
+    async def create_memory(
+            self,
+            user_id: int,
+            content: str,
+            memory_type: str,
+            importance: float
+    ) -> str:
+        """Create a specific memory"""
+
+        db = get_db_sync()
+        try:
+            memory = CompanionMemoryDB(
+                user_id=user_id,
+                content=content,
+                memory_type=memory_type,
+                importance=importance,
+                tags=await self._extract_tags(content)
+            )
+            db.add(memory)
+            db.commit()
+
+            return memory.id
+
+        finally:
+            db.close()
+
+    async def get_memories(
+            self,
+            user_id: int,
+            memory_type: Optional[str] = None,
+            limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Get user memories"""
+
+        db = get_db_sync()
+        try:
+            query = db.query(CompanionMemoryDB).filter(
+                CompanionMemoryDB.user_id == user_id
+            )
+
+            if memory_type:
+                query = query.filter(CompanionMemoryDB.memory_type == memory_type)
+
+            memories = query.order_by(
+                CompanionMemoryDB.importance.desc(),
+                CompanionMemoryDB.created_at.desc()
+            ).limit(limit).all()
+
+            return [
+                {
+                    "id": mem.id,
+                    "content": mem.content,
+                    "type": mem.memory_type,
+                    "importance": mem.importance,
+                    "created_at": mem.created_at.isoformat(),
+                    "tags": mem.tags,
+                    "emotional_weight": mem.emotional_weight
+                }
+                for mem in memories
+            ]
+
+        finally:
+            db.close()
+
+    async def _extract_memories_from_interaction(
+            self,
+            user_message: str,
+            ai_response: str,
+            user_emotion: Optional[EmotionType],
+            ai_emotion: Optional[EmotionType]
+    ) -> List[Dict[str, Any]]:
+        """Extract memorable information from an interaction"""
+
+        memories = []
+
+        # Extract preferences
+        preference_keywords = ["like", "love", "hate", "dislike", "prefer", "favorite", "enjoy"]
+        if any(keyword in user_message.lower() for keyword in preference_keywords):
+            memories.append({
+                "content": f"User expressed: {user_message}",
+                "type": "preference",
+                "importance": 0.7,
+                "emotional_weight": self._calculate_emotional_weight(user_emotion),
+                "tags": await self._extract_tags(user_message),
+                "context": {"original_message": user_message}
+            })
+
+        # Extract personal information
+        personal_keywords = ["my", "i am", "i'm", "my name", "i work", "i live", "my family"]
+        if any(keyword in user_message.lower() for keyword in personal_keywords):
+            memories.append({
+                "content": f"Personal info: {user_message}",
+                "type": "personal",
+                "importance": 0.8,
+                "emotional_weight": self._calculate_emotional_weight(user_emotion),
+                "tags": await self._extract_tags(user_message),
+                "context": {"conversation_context": ai_response[:100]}
+            })
+
+        # Extract emotional moments
+        if user_emotion and user_emotion != EmotionType.NEUTRAL:
+            emotional_weight = self._calculate_emotional_weight(user_emotion)
+            if abs(emotional_weight) > 0.5:  # Strong emotions
+                memories.append({
+                    "content": f"Emotional moment - {user_emotion.value}: {user_message[:200]}",
+                    "type": "emotion",
+                    "importance": 0.6 + abs(emotional_weight) * 0.3,
+                    "emotional_weight": emotional_weight,
+                    "tags": [user_emotion.value] + await self._extract_tags(user_message),
+                    "context": {"ai_response": ai_response[:100]}
+                })
+
+        # Extract goals or aspirations
+        goal_keywords = ["want to", "hope to", "dream of", "plan to", "goal", "aspire"]
+        if any(keyword in user_message.lower() for keyword in goal_keywords):
+            memories.append({
+                "content": f"User goal/aspiration: {user_message}",
+                "type": "goal",
+                "importance": 0.9,
+                "emotional_weight": 0.3,  # Goals are generally positive
+                "tags": ["goal"] + await self._extract_tags(user_message),
+                "context": {"discussed_at": datetime.utcnow().isoformat()}
+            })
+
+        return memories
+
+    def _calculate_emotional_weight(self, emotion: Optional[EmotionType]) -> float:
+        """Calculate emotional weight for memory storage"""
+        if not emotion:
+            return 0.0
+
+        emotion_weights = {
+            EmotionType.JOY: 0.8,
+            EmotionType.LOVE: 0.9,
+            EmotionType.EXCITEMENT: 0.7,
+            EmotionType.CONTENTMENT: 0.4,
+            EmotionType.SADNESS: -0.7,
+            EmotionType.ANGER: -0.8,
+            EmotionType.FEAR: -0.6,
+            EmotionType.ANXIETY: -0.5,
+            EmotionType.NEUTRAL: 0.0,
+            EmotionType.SURPRISE: 0.3
+        }
+
+        return emotion_weights.get(emotion, 0.0)
+
+    async def _extract_tags(self, text: str) -> List[str]:
+        """Extract relevant tags from text"""
+        # Simple keyword extraction - could be enhanced with NLP
+        common_topics = {
+            "work": ["work", "job", "career", "office", "boss", "colleague"],
+            "family": ["family", "parents", "mother", "father", "sibling", "child"],
+            "hobbies": ["hobby", "music", "art", "sports", "reading", "gaming"],
+            "food": ["eat", "food", "restaurant", "cooking", "recipe", "meal"],
+            "travel": ["travel", "trip", "vacation", "country", "city", "visit"],
+            "health": ["health", "exercise", "doctor", "medical", "fitness"],
+            "relationships": ["friend", "relationship", "dating", "partner", "love"],
+            "education": ["school", "university", "study", "learn", "course"],
+            "technology": ["computer", "phone", "app", "internet", "software"],
+            "entertainment": ["movie", "tv", "show", "book", "game", "youtube"]
+        }
+
+        text_lower = text.lower()
+        tags = []
+
+        for topic, keywords in common_topics.items():
+            if any(keyword in text_lower for keyword in keywords):
+                tags.append(topic)
+
+        return tags[:5]  # Limit to 5 tags
+
+    async def _consolidate_memories(self, db: Session, user_id: int):
+        """Consolidate and manage memory storage"""
+        # Apply memory decay
+        await self._apply_memory_decay(db, user_id)
+
+        # Remove low-importance memories if we have too many
+        await self._cleanup_old_memories(db, user_id)
+
+        # Merge similar memories
+        await self._merge_similar_memories(db, user_id)
+
+    async def _apply_memory_decay(self, db: Session, user_id: int):
+        """Apply decay to memories over time"""
+        # Get memories older than 24 hours
+        old_memories = db.query(CompanionMemoryDB).filter(
+            CompanionMemoryDB.user_id == user_id,
+            CompanionMemoryDB.created_at < datetime.utcnow() - timedelta(hours=24)
+        ).all()
+
+        for memory in old_memories:
+            days_old = (datetime.utcnow() - memory.created_at).days
+            decay_factor = 1 - (self.memory_decay_rate * days_old)
+            memory.strength = max(0.1, memory.strength * decay_factor)
+
+            # If strength drops too low, reduce importance
+            if memory.strength < 0.3:
+                memory.importance = max(0.1, memory.importance * 0.9)
+
+        db.commit()
+
+    async def _cleanup_old_memories(self, db: Session, user_id: int):
+        """Remove old, unimportant memories"""
+        for memory_type in ["preference", "personal", "experience", "fact", "emotion", "goal"]:
+            memories = db.query(CompanionMemoryDB).filter(
+                CompanionMemoryDB.user_id == user_id,
+                CompanionMemoryDB.memory_type == memory_type
+            ).order_by(CompanionMemoryDB.importance.desc()).all()
+
+            if len(memories) > self.max_memories_per_type:
+                # Remove least important memories
+                to_remove = memories[self.max_memories_per_type:]
+                for memory in to_remove:
+                    if memory.importance < self.importance_threshold:
+                        db.delete(memory)
+
+        db.commit()
+
+    async def _merge_similar_memories(self, db: Session, user_id: int):
+        """Merge similar memories to avoid redundancy"""
+        # This is a simplified version - could use NLP similarity
+        memories_by_type = {}
+
+        memories = db.query(CompanionMemoryDB).filter(
+            CompanionMemoryDB.user_id == user_id
+        ).all()
+
+        for memory in memories:
+            if memory.memory_type not in memories_by_type:
+                memories_by_type[memory.memory_type] = []
+            memories_by_type[memory.memory_type].append(memory)
+
+        # Simple text similarity check
+        for memory_type, memory_list in memories_by_type.items():
+            for i, memory1 in enumerate(memory_list):
+                for memory2 in memory_list[i + 1:]:
+                    similarity = self._calculate_text_similarity(memory1.content, memory2.content)
+                    if similarity > 0.8:  # Very similar
+                        # Merge into the more important one
+                        if memory1.importance >= memory2.importance:
+                            memory1.importance = min(1.0, memory1.importance + memory2.importance * 0.3)
+                            memory1.access_count += memory2.access_count
+                            db.delete(memory2)
+                        else:
+                            memory2.importance = min(1.0, memory2.importance + memory1.importance * 0.3)
+                            memory2.access_count += memory1.access_count
+                            db.delete(memory1)
+                        break
+
+        db.commit()
+
+    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
+        """Calculate similarity between two texts"""
+        # Simple word overlap similarity
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+
+        if not words1 or not words2:
+            return 0.0
+
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+
+        return len(intersection) / len(union) if union else 0.0
+
+    async def health_check(self) -> bool:
+        """Check memory service health"""
+        try:
+            db = get_db_sync()
+            db.execute("SELECT 1 FROM companion_memories LIMIT 1")
+            db.close()
+            return True
+        except Exception:
+            return False
+
+
+# app/services/analytics_service.py
+from datetime import datetime, timedelta
+from typing import Dict, Any, List
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+import json
+
+from app.database import (
+    UserDB, ChatMessageDB, InteractionHistoryDB,
+    CompanionStateDB, SystemAnalyticsDB, get_db_sync
+)
+from app.models import UserDashboard, InteractionMetrics, CompanionGrowthMetrics
+
+
+class AnalyticsService:
+    """Advanced analytics and insights service"""
+
+    def __init__(self):
+        self.start_time = datetime.utcnow()
+        self.daily_stats_cache = {}
+
+    async def initialize(self):
+        """Initialize analytics service"""
+        logger.info("Initializing Analytics Service...")
+        await self._update_daily_stats()
+
+    async def log_successful_login(self, user_id: int):
+        """Log successful user login"""
+        db = get_db_sync()
+        try:
+            user = db.query(UserDB).filter(UserDB.id == user_id).first()
+            if user:
+                user.last_login = datetime.utcnow()
+                user.last_active = datetime.utcnow()
+                user.failed_login_attempts = 0
+                db.commit()
+        finally:
+            db.close()
+
+    async def log_failed_login(self, email: str):
+        """Log failed login attempt"""
+        db = get_db_sync()
+        try:
+            user = db.query(UserDB).filter(UserDB.email == email).first()
+            if user:
+                user.failed_login_attempts += 1
+                if user.failed_login_attempts >= 5:
+                    user.locked_until = datetime.utcnow() + timedelta(minutes=15)
+                db.commit()
+        finally:
+            db.close()
+
+    async def log_companion_interaction(
+            self,
+            user_id: int,
+            interaction_type: str,
+            companion_state: Any
+    ):
+        """Log companion interaction for analytics"""
+        db = get_db_sync()
+        try:
+            interaction = InteractionHistoryDB(
+                user_id=user_id,
+                interaction_type=interaction_type,
+                timestamp=datetime.utcnow(),
+                companion_emotion=companion_state.mood,
+                context_data={
+                    "bond_level": companion_state.bond_level,
+                    "energy": companion_state.energy,
+                    "mood": companion_state.mood
+                }
+            )
+            db.add(interaction)
+            db.commit()
+        finally:
+            db.close()
+
+    async def log_tts_usage(self, user_id: int, text_length: int):
+        """Log TTS usage"""
+        db = get_db_sync()
+        try:
+            user = db.query(UserDB).filter(UserDB.id == user_id).first()
+            if user:
+                # Estimate voice minutes (average speaking rate: 150 words/minute)
+                estimated_minutes = (text_length / 5) / 150  # 5 chars per word average
+                user.total_voice_minutes += estimated_minutes
+                db.commit()
+        finally:
+            db.close()
+
+    async def get_user_dashboard(self, user_id: int) -> UserDashboard:
+        """Get comprehensive user dashboard"""
+        db = get_db_sync()
+        try:
+            user = db.query(UserDB).filter(UserDB.id == user_id).first()
+            companion_state = db.query(CompanionStateDB).filter(
+                CompanionStateDB.user_id == user_id
+            ).first()
+
+            # Calculate interaction metrics
+            interactions = db.query(InteractionHistoryDB).filter(
+                InteractionHistoryDB.user_id == user_id
+            ).all()
+
+            interaction_metrics = InteractionMetrics(
+                total_messages=user.total_messages,
+                total_voice_minutes=user.total_voice_minutes,
+                average_session_length=await self._calculate_avg_session_length(user_id, db),
+                favorite_interaction_times=await self._get_favorite_times(user_id, db),
+                most_used_features=await self._get_most_used_features(user_id, db),
+                emotional_journey=await self._get_emotional_journey(user_id, db)
+            )
+
+            # Calculate growth metrics
+            growth_metrics = CompanionGrowthMetrics(
+                bond_growth_rate=await self._calculate_bond_growth_rate(user_id, db),
+                skill_improvements=companion_state.skill_data if companion_state else {},
+                milestone_achievements=await self._get_recent_achievements(user_id, db),
+                personality_evolution=await self._get_personality_changes(user_id, db)
+            )
+
+            dashboard = UserDashboard(
+                user_id=user_id,
+                companion_stats=companion_state,
+                interaction_metrics=interaction_metrics,
+                growth_metrics=growth_metrics,
+                recent_highlights=await self._get_recent_highlights(user_id, db),
+                upcoming_features=await self._get_upcoming_features(),
+                personalized_insights=await self._generate_insights(user_id, db)
+            )
+
+            return dashboard
+
+        finally:
+            db.close()
+
+    async def get_companion_growth(self, user_id: int, days: int) -> Dict[str, Any]:
+        """Get companion growth data"""
+        db = get_db_sync()
+        try:
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=days)
+
+            # Get interactions over time
+            interactions = db.query(InteractionHistoryDB).filter(
+                InteractionHistoryDB.user_id == user_id,
+                InteractionHistoryDB.timestamp >= start_date
+            ).order_by(InteractionHistoryDB.timestamp).all()
+
+            # Group by day and calculate metrics
+            daily_data = {}
+            for interaction in interactions:
+                day_key = interaction.timestamp.strftime('%Y-%m-%d')
+                if day_key not in daily_data:
+                    daily_data[day_key] = {
+                        'interactions': 0,
+                        'avg_satisfaction': 0,
+                        'emotions': []
+                    }
+
+                daily_data[day_key]['interactions'] += 1
+                if interaction.satisfaction_score:
+                    daily_data[day_key]['avg_satisfaction'] += interaction.satisfaction_score
+                if interaction.companion_emotion:
+                    daily_data[day_key]['emotions'].append(interaction.companion_emotion)
+
+            # Calculate averages
+            for day_data in daily_data.values():
+                if day_data['interactions'] > 0:
+                    day_data['avg_satisfaction'] /= day_data['interactions']
+
+            return {
+                'period_days': days,
+                'daily_data': daily_data,
+                'total_interactions': len(interactions),
+                'growth_trend': await self._calculate_growth_trend(daily_data)
+            }
+
+        finally:
+            db.close()
+
+    async def get_admin_stats(self) -> Dict[str, Any]:
+        """Get system-wide admin statistics"""
+        db = get_db_sync()
+        try:
+            total_users = db.query(UserDB).count()
+            active_today = db.query(UserDB).filter(
+                UserDB.last_active >= datetime.utcnow().replace(hour=0, minute=0, second=0)
+            ).count()
+            premium_users = db.query(UserDB).filter(UserDB.is_premium == True).count()
+
+            total_messages = db.query(func.sum(UserDB.total_messages)).scalar() or 0
+            total_voice_minutes = db.query(func.sum(UserDB.total_voice_minutes)).scalar() or 0.0
+
+            # Feature usage stats
+            interaction_types = db.query(
+                InteractionHistoryDB.interaction_type,
+                func.count(InteractionHistoryDB.id)
+            ).group_by(InteractionHistoryDB.interaction_type).all()
+
+            return {
+                'users': {
+                    'total': total_users,
+                    'active_today': active_today,
+                    'premium': premium_users,
+                    'conversion_rate': round(premium_users / total_users * 100, 2) if total_users > 0 else 0
+                },
+                'usage': {
+                    'total_messages': total_messages,
+                    'total_voice_minutes': total_voice_minutes,
+                    'avg_messages_per_user': round(total_messages / total_users, 2) if total_users > 0 else 0
+                },
+                'features': {
+                    interaction_type: count for interaction_type, count in interaction_types
+                },
+                'system': {
+                    'uptime_hours': (datetime.utcnow() - self.start_time).total_seconds() / 3600,
+                    'version': '2.0.0'
+                }
+            }
+
+        finally:
+            db.close()
+
+    def get_uptime(self) -> str:
+        """Get system uptime"""
+        uptime_delta = datetime.utcnow() - self.start_time
+        hours = int(uptime_delta.total_seconds() // 3600)
+        minutes = int((uptime_delta.total_seconds() % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+    async def _calculate_avg_session_length(self, user_id: int, db: Session) -> float:
+        """Calculate average session length for user"""
+        # This would require session tracking - simplified for now
+        interactions = db.query(InteractionHistoryDB).filter(
+            InteractionHistoryDB.user_id == user_id,
+            InteractionHistoryDB.duration.isnot(None)
+        ).all()
+
+        if not interactions:
+            return 0.0
+
+        total_duration = sum(i.duration for i in interactions if i.duration)
+        return total_duration / len(interactions)
+
+    async def _get_favorite_times(self, user_id: int, db: Session) -> List[str]:
+        """Get user's favorite interaction times"""
+        interactions = db.query(InteractionHistoryDB).filter(
+            InteractionHistoryDB.user_id == user_id
+        ).all()
+
+        hour_counts = {}
+        for interaction in interactions:
+            hour = interaction.timestamp.hour
+            hour_counts[hour] = hour_counts.get(hour, 0) + 1
+
+        # Return top 3 hours
+        top_hours = sorted(hour_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        return [f"{hour:02d}:00" for hour, _ in top_hours]
+
+    async def _get_most_used_features(self, user_id: int, db: Session) -> List[str]:
+        """Get most used features"""
+        interactions = db.query(
+            InteractionHistoryDB.interaction_type,
+            func.count(InteractionHistoryDB.id)
+        ).filter(
+            InteractionHistoryDB.user_id == user_id
+        ).group_by(
+            InteractionHistoryDB.interaction_type
+        ).order_by(
+            func.count(InteractionHistoryDB.id).desc()
+        ).limit(5).all()
+
+        return [interaction_type for interaction_type, _ in interactions]
+
+    async def _get_emotional_journey(self, user_id: int, db: Session) -> List[Dict[str, Any]]:
+        """Get user's emotional journey over time"""
+        interactions = db.query(InteractionHistoryDB).filter(
+            InteractionHistoryDB.user_id == user_id,
+            InteractionHistoryDB.user_emotion_before.isnot(None)
+        ).order_by(InteractionHistoryDB.timestamp.desc()).limit(20).all()
+
+        return [
+            {
+                'date': interaction.timestamp.isoformat(),
+                'emotion_before': interaction.user_emotion_before,
+                'emotion_after': interaction.user_emotion_after,
+                'satisfaction': interaction.satisfaction_score
+            }
+            for interaction in interactions
+        ]
+
+    async def _update_daily_stats(self):
+        """Update daily statistics cache"""
+        # This would run as a background task
+        pass
+
+    async def health_check(self) -> bool:
+        """Check analytics service health"""
+        return True
