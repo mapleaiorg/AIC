@@ -1,3 +1,6 @@
+# local debug util script
+fix_startup.sh
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
